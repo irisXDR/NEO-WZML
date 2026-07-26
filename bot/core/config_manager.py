@@ -88,6 +88,7 @@ class Config:
     LEECH_SPLIT_SIZE = 2097152000
     MEDIA_GROUP = False
     HYPER_THREADS = 0
+    ARIA2_MAX_DL_SPEED = ""  # e.g. "80M"; empty = unlimited
     USE_HYPER = False
 
 

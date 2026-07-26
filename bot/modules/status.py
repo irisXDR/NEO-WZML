@@ -100,6 +100,15 @@ async def get_download_status(download):
     )
 
 
+async def _safe_answer(query, *args, **kwargs):
+    try:
+        return await query.answer(*args, **kwargs)
+    except QueryIdInvalid:
+        # stale button press — the query expired (e.g. pressed during an
+        # event-loop stall), nothing left to answer
+        return None
+
+
 @new_task
 async def status_pages(_, query):
     data = query.data.split()
@@ -111,7 +120,8 @@ async def status_pages(_, query):
             user_id in (refresh_status := bot_cache["status_refresh"])
             and (time() - refresh_status[user_id]) < 7
         ):
-            return await query.answer(
+            return await _safe_answer(
+                query,
                 f"Already Refreshed! Try after {get_readable_time(7 - (time() - refresh_status[user_id]))}",
                 show_alert=True,
             )
@@ -127,11 +137,11 @@ async def status_pages(_, query):
                     status_dict[key]["page_no"] -= status_dict[key]["page_step"]
     elif data[2] == "ps":
         if len(data) < 4:
-            return await query.answer("Malformed callback.", show_alert=True)
+            return await _safe_answer(query, "Malformed callback.", show_alert=True)
         try:
             step = int(data[3])
         except (TypeError, ValueError):
-            return await query.answer("Invalid page step.", show_alert=True)
+            return await _safe_answer(query, "Invalid page step.", show_alert=True)
         async with task_dict_lock:
             if key in status_dict:
                 status_dict[key]["page_step"] = max(1, min(step, 50))

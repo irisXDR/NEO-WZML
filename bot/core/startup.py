@@ -400,8 +400,12 @@ async def load_configurations():
         f"--http-accept-gzip=true --max-file-not-found=0 --max-tries=20 "
         f"--peer-id-prefix=-qB4520- --reuse-uri=true --content-disposition-default-utf8=true "
         f"--user-agent=Wget/1.12 --peer-agent=qBittorrent/4.5.2 --quiet=true "
-        f"--summary-interval=0 --max-upload-limit=1K"
+        f"--summary-interval=0 --max-upload-limit=1K --file-allocation=none"
     )
+    if Config.ARIA2_MAX_DL_SPEED:
+        # cap aggregate download rate so a fast mirror can't saturate the
+        # VPS disk/NIC and freeze the whole machine (e.g. "80M")
+        aria2_cmd += f" --max-overall-download-limit={Config.ARIA2_MAX_DL_SPEED}"
     await (await create_subprocess_shell(aria2_cmd)).wait()
 
     PORT = getenv("PORT", "") or Config.BASE_URL_PORT

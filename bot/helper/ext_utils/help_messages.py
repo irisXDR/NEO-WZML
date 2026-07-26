@@ -1223,6 +1223,7 @@ config_descriptions = {
     "CMD_SUFFIX": "Suffix added to all bot commands. Useful for multi-instance",
 
     "HYPER_THREADS": "Parallel transfer threads per helper client for Hyper download/upload. 0 = auto-detect",
+    "ARIA2_MAX_DL_SPEED": "Cap aria2's total download speed, e.g. 80M. Prevents VPS freeze on fast mirrors. Empty = unlimited",
     "HYDRA_IP": "Hydra download accelerator server IP. Leave empty if not using Hydra",
     "HYDRA_API_KEY": "API key for Hydra download accelerator authentication",
 

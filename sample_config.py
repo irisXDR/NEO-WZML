@@ -123,6 +123,10 @@ USE_HYPER = False
 # Parallel transfer threads per helper client. 0 = auto
 HYPER_THREADS = 0
 
+# Cap aria2's aggregate download rate (e.g. "80M") so a fast mirror
+# can't saturate the VPS disk/NIC and freeze the machine. Empty = unlimited
+ARIA2_MAX_DL_SPEED = ""
+
 # Mega
 MEGA_EMAIL = ""
 MEGA_PASSWORD = ""
