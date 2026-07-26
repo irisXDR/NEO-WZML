@@ -1071,7 +1071,8 @@ config_descriptions = {
 
     "AUTHORIZED_CHATS": "User/Chat IDs that can use the bot. Space-separated",
     "SUDO_USERS": "User IDs with admin privileges. Space-separated",
-    "HELPER_TOKENS": "User IDs with helper privileges. Space-separated",
+    "HELPER_TOKENS": "Helper bot tokens for Hyper transfers. Space-separated",
+    "USE_HYPER": "Use helper bots for accelerated Telegram download/upload. Needs HELPER_TOKENS + LEECH_DUMP_CHAT",
     "EXCEP_CHATS": "Chat IDs where logging is disabled",
     "FORCE_SUB_IDS": "Chat IDs users must subscribe to before using the bot",
 
@@ -1221,7 +1222,7 @@ config_descriptions = {
     "SET_COMMANDS": "Automatically set bot commands in Telegram on startup",
     "CMD_SUFFIX": "Suffix added to all bot commands. Useful for multi-instance",
 
-    "HYPER_THREADS": "Thread count for accelerated downloads. 0 = auto-detect",
+    "HYPER_THREADS": "Parallel transfer threads per helper client for Hyper download/upload. 0 = auto-detect",
     "HYDRA_IP": "Hydra download accelerator server IP. Leave empty if not using Hydra",
     "HYDRA_API_KEY": "API key for Hydra download accelerator authentication",
 

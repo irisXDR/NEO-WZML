@@ -283,7 +283,6 @@ class HyperTGDownload:
 
                                 current_part += 1
                                 current_offset += self.chunk_size
-                                self._processed_bytes += len(chunk)
                             else:
                                 raise ValueError(f"Unexpected response: {r}")
 
@@ -325,7 +324,7 @@ class HyperTGDownload:
             except Exception:
                 await sleep(1)
 
-    async def single_part(self, start, end, part_index, max_retries=3):
+    async def single_part(self, start, end, temp_file_path, max_retries=3):
         until_bytes, from_bytes = min(end, self.file_size - 1), start
 
         offset = from_bytes - (from_bytes % self.chunk_size)
@@ -335,25 +334,30 @@ class HyperTGDownload:
         part_count = ceil(until_bytes / self.chunk_size) - floor(
             offset / self.chunk_size
         )
-        part_file_path = ospath.join(
-            self.directory, f"{self.file_name}.temp.{part_index:02d}"
-        )
 
         for attempt in range(max_retries):
+            written = 0
             try:
-                async with aiopen(part_file_path, "wb") as f:
+                # Write this range directly at its offset into the shared
+                # preallocated file: no per-part temp files, no second
+                # concatenation pass over the whole payload.
+                async with aiopen(temp_file_path, "rb+") as f:
+                    await f.seek(from_bytes)
                     async for chunk in self.get_file(
                         offset, first_part_cut, last_part_cut, part_count
                     ):
                         if self._cancel_event.is_set():
                             raise CancelledError("Download cancelled")
                         await f.write(chunk)
-                return part_index, part_file_path
+                        written += len(chunk)
+                        self._processed_bytes += len(chunk)
+                return
             except (AsyncTimeoutError, ConnectionError):
+                # roll back only this part's progress, not the whole task's
+                self._processed_bytes -= written
                 if attempt == max_retries - 1:
                     raise
                 await sleep((attempt + 1) * 2)
-                self._processed_bytes = 0
 
     async def handle_download(self, progress, progress_args):
         self._cancel_event.clear()
@@ -379,37 +383,30 @@ class HyperTGDownload:
 
         tasks = []
         prog_task = None
+        success = False
 
         try:
-            for i, (start, end) in enumerate(ranges):
-                tasks.append(create_task(self.single_part(start, end, i)))
+            # Preallocate the final file once; every part task then writes
+            # its byte range in place concurrently.
+            async with aiopen(temp_file_path, "wb") as f:
+                await f.truncate(self.file_size)
+
+            for start, end in ranges:
+                tasks.append(
+                    create_task(self.single_part(start, end, temp_file_path))
+                )
 
             if progress:
                 prog_task = create_task(self.progress_callback(progress, progress_args))
 
-            results = await gather(*tasks)
-
-            async with aiopen(temp_file_path, "wb") as temp_file:
-                for _, part_file_path in sorted(results, key=lambda x: x[0]):
-                    try:
-                        async with aiopen(part_file_path, "rb") as part_file:
-                            while True:
-                                chunk = await part_file.read(8 * 1024 * 1024)
-                                if not chunk:
-                                    break
-                                await temp_file.write(chunk)
-                        await remove(part_file_path)
-                    except Exception as e:
-                        LOGGER.error(
-                            f"Error processing part file {part_file_path}: {e}"
-                        )
-                        raise
+            await gather(*tasks)
 
             if prog_task and not prog_task.done():
                 prog_task.cancel()
 
             file_path = ospath.splitext(temp_file_path)[0]
             await move(temp_file_path, file_path)
+            success = True
 
             return file_path
 
@@ -432,13 +429,10 @@ class HyperTGDownload:
             if tasks:
                 await gather(*tasks, return_exceptions=True)
 
-            for i in range(len(ranges)):
-                part_path = ospath.join(
-                    self.directory, f"{self.file_name}.temp.{i:02d}"
-                )
+            if not success:
                 try:
-                    if ospath.exists(part_path):
-                        await remove(part_path)
+                    if ospath.exists(temp_file_path):
+                        await remove(temp_file_path)
                 except Exception:
                     pass
 

@@ -88,6 +88,7 @@ class Config:
     LEECH_SPLIT_SIZE = 2097152000
     MEDIA_GROUP = False
     HYPER_THREADS = 0
+    USE_HYPER = False
 
 
     MIRROR_PREFIX = ""

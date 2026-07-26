@@ -53,7 +53,7 @@ commands = {
     ),
     "7z": (["7z", "i"], r"7-Zip ([\d.]+)"),
     "aiohttp": (["uv", "pip", "show", "aiohttp"], r"Version: ([\d.]+)"),
-    "pyroblack": (["uv", "pip", "show", "pyroblack"], r"Version: ([\d.]+)"),
+    "wzgram": (["uv", "pip", "show", "wzgram"], r"Version: ([\d.]+)"),
     "gapi": (["uv", "pip", "show", "google-api-python-client"], r"Version: ([\d.]+)"),
     "mega": (["echo", "8.1.1"], r"([\d.]+)"),  # MegaSDK v8.1.1 compiled from source
 }
@@ -160,7 +160,7 @@ async def get_stats(event, key="home"):
  • <b>ffmpeg:</b> {ver.get("ffmpeg", "N/A")}
  • <b>7z:</b> {ver.get("7z", "N/A")}
  • <b>Aiohttp:</b> {ver.get("aiohttp", "N/A")}
- • <b>pyroblack:</b> {ver.get("pyroblack", "N/A")}
+ • <b>wzgram:</b> {ver.get("wzgram", "N/A")}
  • <b>Google API:</b> {ver.get("gapi", "N/A")}
  • <b>MegaSDK:</b> {ver.get("mega", "8.1.1")}
  • <b>teraboxSDK:</b> {ver.get("terabox", "N/A")}

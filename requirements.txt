@@ -28,7 +28,6 @@ pillow
 psutil
 pycountry
 pymongo
-pyroblack
 python-magic
 pytz
 qbittorrent-api
@@ -36,10 +35,12 @@ requests
 speedtest-cli
 telegraph
 tenacity
-tgcrypto-pyroblack
 urllib3
 uvicorn
 uvloop==0.21.0
+# wzgram (github.com/rjriajul/wzgram): drop-in pyrogram replacement with
+# Rust crypto (warpcrypto) for faster Telegram upload/download
+wzgram
 xattr
 yt-dlp[default,curl-cffi]
 parse-torrent-name

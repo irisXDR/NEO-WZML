@@ -24,14 +24,14 @@ class TgClient:
     MAX_SPLIT_SIZE = 2097152000
 
     @classmethod
-    def neoTgClient(cls, *args, **kwargs):
+    def neoTgClient(cls, *args, max_concurrent_transmissions=3, **kwargs):
         kwargs["api_id"] = Config.TELEGRAM_API
         kwargs["api_hash"] = Config.TELEGRAM_HASH
         kwargs["proxy"] = Config.TG_PROXY
         kwargs["parse_mode"] = enums.ParseMode.HTML
         kwargs["in_memory"] = True
         for param, value in {
-            "max_concurrent_transmissions": 3,
+            "max_concurrent_transmissions": max_concurrent_transmissions,
             "skip_updates": False,
         }.items():
             if param in signature(Client.__init__).parameters:
@@ -45,6 +45,9 @@ class TgClient:
                 f"NEO-WZML-HBot{no}",
                 bot_token=b_token,
                 no_updates=True,
+                # helper bots carry Hyper transfers: allow more parallel
+                # chunk streams per client for higher throughput
+                max_concurrent_transmissions=Config.HYPER_THREADS or 8,
             ).start()
             LOGGER.info(f"Helper Bot [@{hbot.me.username}] Started!")
             cls.helper_bots[no], cls.helper_loads[no] = hbot, 0

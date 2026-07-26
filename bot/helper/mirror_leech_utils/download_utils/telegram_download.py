@@ -37,7 +37,11 @@ class TelegramDownloadHelper:
         self._id = ""
         self._gid = ""
         self.session = ""
-        self._hyper_dl = len(TgClient.helper_bots) != 0 and Config.LEECH_DUMP_CHAT
+        self._hyper_dl = bool(
+            Config.USE_HYPER
+            and len(TgClient.helper_bots) != 0
+            and Config.LEECH_DUMP_CHAT
+        )
 
     async def _release_global_gid(self):
         if not self._id:

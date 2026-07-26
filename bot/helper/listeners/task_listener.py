@@ -509,7 +509,7 @@ class TaskListener(TaskConfig):
         if self.is_leech:
             tg = TelegramUploader(self, up_dir)
             async with task_dict_lock:
-                task_dict[self.mid] = TelegramStatus(self, tg, gid, "up")
+                task_dict[self.mid] = TelegramStatus(self, tg, gid, "up", tg.hyper)
             await gather(
                 update_status_message(self.message.chat.id),
                 tg.upload(),

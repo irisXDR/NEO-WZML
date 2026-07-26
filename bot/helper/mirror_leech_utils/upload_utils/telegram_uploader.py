@@ -9,7 +9,15 @@ from time import time
 from aioshutil import rmtree
 from natsort import natsorted
 from PIL import Image
-from pyrogram.errors import BadRequest, FloodWait, RPCError
+from pyrogram.errors import (
+    BadRequest,
+    ChannelInvalid,
+    ChatAdminRequired,
+    ChatWriteForbidden,
+    FloodWait,
+    PeerIdInvalid,
+    RPCError,
+)
 
 try:
     from pyrogram.errors import FloodPremiumWait
@@ -83,6 +91,14 @@ class TelegramUploader:
             self._listener.user_dict.get("AUTO_THUMBNAIL", False)
         )
         self._auto_thumb_path = None
+        # HyperUpload: rotate HELPER_TOKENS bots per file for faster,
+        # flood-wait-free uploads. Files are still sent strictly one by
+        # one in natural sort order, so series episodes and split parts
+        # always land in sequence.
+        self._hyper_ul = bool(
+            Config.USE_HYPER and TgClient.helper_bots and listener.up_dest
+        )
+        self._helper_index = None
 
     def _check_cancelled(self):
         if self._listener.is_cancelled:
@@ -182,9 +198,18 @@ class TelegramUploader:
         if self._prm_media and TgClient.IS_PREMIUM_USER:
             self._user_session = True
             self._client = TgClient.user
+            self._helper_index = None
+        elif self._hyper_ul and not self._prm_media:
+            # Pick the least-loaded helper bot for this file
+            self._user_session = False
+            self._helper_index = min(
+                TgClient.helper_loads, key=TgClient.helper_loads.get
+            )
+            self._client = TgClient.helper_bots[self._helper_index]
         else:
             self._user_session = False
             self._client = self._listener.client
+            self._helper_index = None
 
     async def _prepare_file(self, pre_file_, dirpath):
         cap_file_ = file_ = pre_file_
@@ -547,7 +572,13 @@ class TelegramUploader:
                                         await self._send_media_group(subkey, key, msgs)
                     self._last_msg_in_group = False
                     self._last_uploaded = 0
-                    await self._upload_file(cap_mono, file_, f_path)
+                    if self._helper_index is not None:
+                        TgClient.helper_loads[self._helper_index] += 1
+                    try:
+                        await self._upload_file(cap_mono, file_, f_path)
+                    finally:
+                        if self._helper_index is not None:
+                            TgClient.helper_loads[self._helper_index] -= 1
                     if self._log_msg and not is_log_del and Config.CLEAN_LOG_MSG:
                         await delete_message(self._log_msg)
                         is_log_del = True
@@ -562,7 +593,10 @@ class TelegramUploader:
                         and hasattr(self._sent_msg, "link")
                     ):
                         self._msgs_dict[self._sent_msg.link] = file_
-                    await sleep(1)
+                    if self._helper_index is None:
+                        # flood-avoid delay for single-client uploads;
+                        # HyperUpload rotates helper bots instead
+                        await sleep(1)
                 except CancelledUpload:
                     return
                 except Exception as err:
@@ -909,6 +943,25 @@ class TelegramUploader:
         except FileNotFoundError:
             self._check_cancelled()
             raise
+        except (
+            PeerIdInvalid,
+            ChannelInvalid,
+            ChatWriteForbidden,
+            ChatAdminRequired,
+        ) as err:
+            if self._helper_index is not None and self._hyper_ul:
+                # Helper bot can't post in this chat (not admin/member).
+                # Disable HyperUpload for this task and retry with the
+                # default client so the upload keeps its sequence.
+                LOGGER.warning(
+                    f"HyperUpload: helper bot can't post in chat "
+                    f"{self._upload_chat_id} ({err}). Falling back to default client."
+                )
+                self._hyper_ul = False
+                self._user_session = False
+                self._client = self._listener.client
+                return await self._upload_file(cap_mono, file, o_path, force_document)
+            raise
         except Exception as err:
             if (
                 self._thumb is None
@@ -922,6 +975,10 @@ class TelegramUploader:
                 LOGGER.error(f"Retrying As Document. Path: {self._up_path}")
                 return await self._upload_file(cap_mono, file, o_path, True)
             raise err
+
+    @property
+    def hyper(self):
+        return self._hyper_ul
 
     @property
     def speed(self):

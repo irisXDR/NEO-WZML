@@ -112,8 +112,16 @@ MIRROR_LOG_ID = ""
 AUTHOR_NAME = ""
 AUTHOR_URL = ""
 
-# Hyper TG (helper bot tokens, comma-separated)
+# Hyper TG (helper bot tokens, space-separated)
 HELPER_TOKENS = ""
+# Use HELPER_TOKENS bots for accelerated (multi-client) Telegram
+# download AND upload. Requires HELPER_TOKENS and LEECH_DUMP_CHAT
+# (helper bots must be admin there). Files are always sent in
+# series (natural sort order), so episodes and split parts keep
+# their sequence.
+USE_HYPER = False
+# Parallel transfer threads per helper client. 0 = auto
+HYPER_THREADS = 0
 
 # Mega
 MEGA_EMAIL = ""
