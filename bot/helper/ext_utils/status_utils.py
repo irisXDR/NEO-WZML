@@ -7,6 +7,19 @@ from time import time
 
 from psutil import cpu_percent, disk_usage, virtual_memory
 from pyrogram import __version__ as pyrover
+
+
+def _tgram_engine():
+    # wzgram/pyroblack both install as module `pyrogram`; report the
+    # actual distribution so the status engine tag is truthful
+    from importlib.metadata import PackageNotFoundError, version as pkg_version
+
+    for dist, label in (("wzgram", "wzgram"), ("pyroblack", "Pyro")):
+        try:
+            return f"{label} v{pkg_version(dist)}"
+        except PackageNotFoundError:
+            continue
+    return f"Pyro v{pyrover}"
 from bot import (
     DOWNLOAD_DIR,
     bot_cache,
@@ -50,7 +63,7 @@ class EngineStatus:
         self.STATUS_AIOHTTP = f"AioHttp v{ver.get('aiohttp', 'N/A')}"
         self.STATUS_GDAPI = f"Google-API v{ver.get('gapi', 'N/A')}"
         self.STATUS_QBIT = f"qBit v{ver.get('qBittorrent', 'N/A')}"
-        self.STATUS_TGRAM = f"Pyro v{pyrover}"
+        self.STATUS_TGRAM = _tgram_engine()
         self.STATUS_MEGA = f"MegaSDK v{ver.get('mega', '8.1.1')}"
         self.STATUS_TERABOX = f"teraboxSDK v{ver.get('terabox', '1.0.0')}"
         self.STATUS_YTDLP = f"yt-dlp v{ver.get('yt-dlp', 'N/A')}"

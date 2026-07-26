@@ -1,6 +1,6 @@
 # This file is a part of NEO-WZML (github.com/irisXDR/NEO-WZML)
 
-from asyncio import sleep
+from asyncio import Lock, Semaphore, create_task, gather, sleep
 from logging import getLogger
 from os import path as ospath, walk
 from re import match as re_match, sub as re_sub
@@ -9,6 +9,7 @@ from time import time
 from aioshutil import rmtree
 from natsort import natsorted
 from PIL import Image
+from pyrogram import StopTransmission
 from pyrogram.errors import (
     BadRequest,
     ChannelInvalid,
@@ -48,6 +49,10 @@ from bot.helper.ext_utils.media_utils import (
     get_md5_hash,
 )
 from bot.helper.telegram_helper.message_utils import delete_message
+from bot.helper.mirror_leech_utils.upload_utils.hyperul_utils import (
+    build_uploaded_media,
+    raw_send_media,
+)
 
 LOGGER = getLogger(__name__)
 
@@ -91,14 +96,16 @@ class TelegramUploader:
             self._listener.user_dict.get("AUTO_THUMBNAIL", False)
         )
         self._auto_thumb_path = None
-        # HyperUpload: rotate HELPER_TOKENS bots per file for faster,
-        # flood-wait-free uploads. Files are still sent strictly one by
-        # one in natural sort order, so series episodes and split parts
-        # always land in sequence.
+        # HyperUpload: HELPER_TOKENS bots pre-upload several files in
+        # parallel (aggregate speed scales with bot count) while a single
+        # sender posts them strictly in natural sort order, so series
+        # episodes and split parts always land in sequence.
         self._hyper_ul = bool(
             Config.USE_HYPER and TgClient.helper_bots and listener.up_dest
         )
         self._helper_index = None
+        self._prep_lock = Lock()
+        self._is_log_del = False
 
     def _check_cancelled(self):
         if self._listener.is_cancelled:
@@ -511,7 +518,8 @@ class TelegramUploader:
         res = await self._msg_to_reply()
         if not res:
             return
-        is_log_del = False
+        self._is_log_del = False
+        items = []
         for dirpath, _, files in natsorted(await sync_to_async(walk, self._path)):
             if dirpath.strip().endswith("/yt-dlp-thumb"):
                 continue
@@ -520,95 +528,15 @@ class TelegramUploader:
                 await rmtree(dirpath, ignore_errors=True)
                 continue
             for file_ in natsorted(files):
-                self._error = ""
-                self._up_path = f_path = ospath.join(dirpath, file_)
-                if not await aiopath.exists(self._up_path):
-                    LOGGER.error(f"{self._up_path} not exists! Continue uploading!")
-                    continue
-                try:
-                    f_size = await aiopath.getsize(self._up_path)
+                items.append((dirpath, file_))
 
-                    is_allowed, reason = await check_strict_file_mode(self._up_path, file_)
-                    if not is_allowed:
-                        LOGGER.info(f"STRICT_FILE_MODE: Skipping {reason}: {self._up_path}")
-                        await remove(self._up_path)
-                        continue
-                    else:
-                        if Config.STRICT_FILE_MODE:
-                            LOGGER.info(f"STRICT_FILE_MODE: Uploading video {file_} ({f_size / (1024*1024):.2f}MB)")
-
-                    self._total_files += 1
-
-                    self._prm_media = True if f_size > 2097152000 else False
-
-                    max_size = 4194304000 if (self._prm_media and TgClient.IS_PREMIUM_USER) else 2097152000
-                    if f_size > max_size:
-                        raise ValueError(
-                            f"File {self._up_path} ({f_size} bytes) exceeds max "
-                            f"{max_size} bytes. File should have been split during download."
-                        )
-
-                    await self._switching_client()
-
-                    if f_size == 0:
-                        LOGGER.error(
-                            f"{self._up_path} size is zero, telegram don't upload zero size files"
-                        )
-                        self._corrupted += 1
-                        continue
-                    if self._listener.is_cancelled:
-                        return
-                    await self._user_settings()
-                    cap_mono = await self._prepare_file(file_, dirpath)
-                    if self._last_msg_in_group:
-                        group_lists = [
-                            x for v in self._media_dict.values() for x in v.keys()
-                        ]
-                        match = re_match(r".+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)", f_path)
-                        if not match or match and match.group(0) not in group_lists:
-                            for key, value in list(self._media_dict.items()):
-                                for subkey, msgs in list(value.items()):
-                                    if len(msgs) > 1:
-                                        await self._send_media_group(subkey, key, msgs)
-                    self._last_msg_in_group = False
-                    self._last_uploaded = 0
-                    if self._helper_index is not None:
-                        TgClient.helper_loads[self._helper_index] += 1
-                    try:
-                        await self._upload_file(cap_mono, file_, f_path)
-                    finally:
-                        if self._helper_index is not None:
-                            TgClient.helper_loads[self._helper_index] -= 1
-                    if self._log_msg and not is_log_del and Config.CLEAN_LOG_MSG:
-                        await delete_message(self._log_msg)
-                        is_log_del = True
-                    if self._listener.is_cancelled:
-                        return
-                    if (
-                        not self._is_corrupted
-                        and (self._listener.is_super_chat or self._listener.up_dest)
-                        and self._sent_msg is not None
-                        and hasattr(self._sent_msg, "chat")
-                        and self._sent_msg.chat is not None
-                        and hasattr(self._sent_msg, "link")
-                    ):
-                        self._msgs_dict[self._sent_msg.link] = file_
-                    if self._helper_index is None:
-                        # flood-avoid delay for single-client uploads;
-                        # HyperUpload rotates helper bots instead
-                        await sleep(1)
-                except CancelledUpload:
-                    return
-                except Exception as err:
-                    LOGGER.error(f"{err}. Path: {self._up_path}", exc_info=True)
-                    self._error = str(err)
-                    self._corrupted += 1
-                    if self._listener.is_cancelled:
-                        return
-                if not self._listener.is_cancelled and await aiopath.exists(
-                    self._up_path
-                ):
-                    await remove(self._up_path)
+        if self._hyper_ul and len(items) > 1:
+            # HyperUpload: helper bots pre-upload several files at once;
+            # a single sender then posts them strictly in natsorted order,
+            # so series episodes and split parts always stay in sequence.
+            await self._hyper_pipeline(items)
+        else:
+            await self._upload_items(items)
         if self._listener.is_cancelled:
             return
         for key, value in list(self._media_dict.items()):
@@ -639,6 +567,434 @@ class TelegramUploader:
             None, self._msgs_dict, self._total_files, self._corrupted
         )
         return
+
+
+    async def _upload_items(self, items):
+        for dirpath, file_ in items:
+            self._error = ""
+            self._up_path = f_path = ospath.join(dirpath, file_)
+            if not await aiopath.exists(self._up_path):
+                LOGGER.error(f"{self._up_path} not exists! Continue uploading!")
+                continue
+            try:
+                f_size = await aiopath.getsize(self._up_path)
+
+                is_allowed, reason = await check_strict_file_mode(self._up_path, file_)
+                if not is_allowed:
+                    LOGGER.info(f"STRICT_FILE_MODE: Skipping {reason}: {self._up_path}")
+                    await remove(self._up_path)
+                    continue
+                else:
+                    if Config.STRICT_FILE_MODE:
+                        LOGGER.info(f"STRICT_FILE_MODE: Uploading video {file_} ({f_size / (1024*1024):.2f}MB)")
+
+                self._total_files += 1
+
+                self._prm_media = True if f_size > 2097152000 else False
+
+                max_size = 4194304000 if (self._prm_media and TgClient.IS_PREMIUM_USER) else 2097152000
+                if f_size > max_size:
+                    raise ValueError(
+                        f"File {self._up_path} ({f_size} bytes) exceeds max "
+                        f"{max_size} bytes. File should have been split during download."
+                    )
+
+                await self._switching_client()
+
+                if f_size == 0:
+                    LOGGER.error(
+                        f"{self._up_path} size is zero, telegram don't upload zero size files"
+                    )
+                    self._corrupted += 1
+                    continue
+                if self._listener.is_cancelled:
+                    return
+                await self._user_settings()
+                cap_mono = await self._prepare_file(file_, dirpath)
+                if self._last_msg_in_group:
+                    group_lists = [
+                        x for v in self._media_dict.values() for x in v.keys()
+                    ]
+                    match = re_match(r".+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)", f_path)
+                    if not match or match and match.group(0) not in group_lists:
+                        for key, value in list(self._media_dict.items()):
+                            for subkey, msgs in list(value.items()):
+                                if len(msgs) > 1:
+                                    await self._send_media_group(subkey, key, msgs)
+                self._last_msg_in_group = False
+                self._last_uploaded = 0
+                if self._helper_index is not None:
+                    TgClient.helper_loads[self._helper_index] += 1
+                try:
+                    await self._upload_file(cap_mono, file_, f_path)
+                finally:
+                    if self._helper_index is not None:
+                        TgClient.helper_loads[self._helper_index] -= 1
+                if self._log_msg and not self._is_log_del and Config.CLEAN_LOG_MSG:
+                    await delete_message(self._log_msg)
+                    self._is_log_del = True
+                if self._listener.is_cancelled:
+                    return
+                if (
+                    not self._is_corrupted
+                    and (self._listener.is_super_chat or self._listener.up_dest)
+                    and self._sent_msg is not None
+                    and hasattr(self._sent_msg, "chat")
+                    and self._sent_msg.chat is not None
+                    and hasattr(self._sent_msg, "link")
+                ):
+                    self._msgs_dict[self._sent_msg.link] = file_
+                if self._helper_index is None:
+                    # flood-avoid delay for single-client uploads;
+                    # HyperUpload rotates helper bots instead
+                    await sleep(1)
+            except CancelledUpload:
+                return
+            except Exception as err:
+                LOGGER.error(f"{err}. Path: {self._up_path}", exc_info=True)
+                self._error = str(err)
+                self._corrupted += 1
+                if self._listener.is_cancelled:
+                    return
+            if not self._listener.is_cancelled and await aiopath.exists(
+                self._up_path
+            ):
+                await remove(self._up_path)
+
+    async def _hyper_pipeline(self, items):
+        """Parallel HyperUpload: helper bots pre-upload up to `slots`
+        files concurrently while a single in-order sender posts each
+        finished file, so aggregate speed scales with HELPER_TOKENS but
+        series episodes and split parts never post out of order."""
+        slots = len(TgClient.helper_bots)
+        if Config.HYPER_THREADS:
+            slots = min(slots, Config.HYPER_THREADS)
+        slots = max(1, min(slots, 8))
+        sem = Semaphore(slots)
+
+        async def prefetch(dirpath, file_):
+            async with sem:
+                if self._listener.is_cancelled:
+                    return None
+                try:
+                    return await self._hyper_prefetch(dirpath, file_)
+                except Exception as e:
+                    LOGGER.error(f"HyperUL prefetch failed: {e}", exc_info=True)
+                    self._error = str(e)
+                    self._corrupted += 1
+                    return None
+
+        # tasks acquire the semaphore in creation order, so earlier
+        # episodes always get upload slots first
+        tasks = [create_task(prefetch(d, f)) for d, f in items]
+        try:
+            for task in tasks:
+                res = await task
+                if self._listener.is_cancelled:
+                    return
+                if res is None:
+                    continue
+                try:
+                    await self._hyper_send(res)
+                except CancelledUpload:
+                    return
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await gather(*tasks, return_exceptions=True)
+
+    def _hyper_progress(self, client):
+        state = {"last": 0}
+
+        async def progress(current, _):
+            if self._listener.is_cancelled:
+                client.stop_transmission()
+            self._processed_bytes += current - state["last"]
+            state["last"] = current
+
+        return progress
+
+    async def _hyper_media_meta(self, file_):
+        """Detect media kind and prepare thumb/dimensions for the current
+        self._up_path (mirrors the classic _upload_file prep)."""
+        thumb = self._thumb
+        if thumb is not None and thumb != "none" and not await aiopath.exists(thumb):
+            thumb = None
+        is_video, is_audio, is_image = await get_document_type(self._up_path)
+        meta = {
+            "duration": 0,
+            "width": 0,
+            "height": 0,
+            "performer": None,
+            "title": None,
+        }
+
+        if not is_image and thumb is None:
+            file_name = ospath.splitext(file_)[0]
+            thumb_path = f"{self._path}/yt-dlp-thumb/{file_name}.jpg"
+            if await aiopath.isfile(thumb_path):
+                thumb = thumb_path
+            elif await aiopath.isfile(thumb_path.replace("/yt-dlp-thumb", "")):
+                thumb = thumb_path.replace("/yt-dlp-thumb", "")
+            elif is_audio and not is_video:
+                thumb = await get_audio_thumbnail(self._up_path)
+
+        if self._listener.as_doc or (not is_video and not is_audio and not is_image):
+            kind = "document"
+            if is_video and thumb is None:
+                thumb = await get_video_thumbnail(self._up_path, None)
+        elif is_video:
+            kind = "video"
+            meta["duration"] = (await get_media_info(self._up_path))[0]
+            if self._auto_thumb_enabled and thumb is None:
+                from bot.helper.thumbnail_utils import ThumbnailFetcher
+
+                self._auto_thumb_path = await ThumbnailFetcher.fetch_thumbnail(
+                    ospath.basename(self._up_path), self._listener.user_id
+                )
+                if self._auto_thumb_path:
+                    thumb = self._auto_thumb_path
+            if thumb is None and self._listener.thumbnail_layout:
+                thumb = await get_multiple_frames_thumbnail(
+                    self._up_path,
+                    self._listener.thumbnail_layout,
+                    self._listener.screen_shots,
+                )
+            if thumb is None:
+                thumb = await get_video_thumbnail(self._up_path, meta["duration"])
+            if thumb is not None and thumb != "none":
+                with Image.open(thumb) as img:
+                    meta["width"], meta["height"] = img.size
+            else:
+                meta["width"], meta["height"] = 480, 320
+        elif is_audio:
+            kind = "audio"
+            meta["duration"], meta["performer"], meta["title"] = await get_media_info(
+                self._up_path
+            )
+        else:
+            kind = "photo"
+
+        if thumb == "none":
+            thumb = None
+        meta["kind"] = kind
+        meta["thumb"] = thumb
+        return meta
+
+    async def _hyper_prefetch(self, dirpath, file_):
+        """Prep one file and pre-upload its bytes with the least-loaded
+        helper bot. Returns None to skip the file, or a dict for the
+        in-order sender."""
+        f_path = ospath.join(dirpath, file_)
+        async with self._prep_lock:
+            if self._listener.is_cancelled:
+                return None
+            self._error = ""
+            self._up_path = f_path
+            if not await aiopath.exists(self._up_path):
+                LOGGER.error(f"{self._up_path} not exists! Continue uploading!")
+                return None
+            try:
+                f_size = await aiopath.getsize(self._up_path)
+                is_allowed, reason = await check_strict_file_mode(
+                    self._up_path, file_
+                )
+                if not is_allowed:
+                    LOGGER.info(
+                        f"STRICT_FILE_MODE: Skipping {reason}: {self._up_path}"
+                    )
+                    await remove(self._up_path)
+                    return None
+                self._total_files += 1
+                if f_size == 0:
+                    LOGGER.error(
+                        f"{self._up_path} size is zero, telegram don't upload zero size files"
+                    )
+                    self._corrupted += 1
+                    return None
+                prm = f_size > 2097152000
+                max_size = (
+                    4194304000 if (prm and TgClient.IS_PREMIUM_USER) else 2097152000
+                )
+                if f_size > max_size:
+                    raise ValueError(
+                        f"File {self._up_path} ({f_size} bytes) exceeds max "
+                        f"{max_size} bytes. File should have been split during download."
+                    )
+                await self._user_settings()
+                cap_mono = await self._prepare_file(file_, dirpath)
+                up_path = self._up_path
+                base = {
+                    "cap": cap_mono,
+                    "file": file_,
+                    "path": up_path,
+                    "f_path": f_path,
+                }
+                if prm:
+                    # >2GB needs the premium user session; the sender
+                    # falls back to the classic upload for this file
+                    return {"mode": "classic", **base}
+                meta = await self._hyper_media_meta(file_)
+            except Exception as err:
+                LOGGER.error(f"{err}. Path: {self._up_path}", exc_info=True)
+                self._error = str(err)
+                self._corrupted += 1
+                return None
+
+        # heavy byte transfer runs outside the lock, in parallel
+        index = min(TgClient.helper_loads, key=TgClient.helper_loads.get)
+        client = TgClient.helper_bots[index]
+        TgClient.helper_loads[index] += 1
+        try:
+            uploaded = None
+            for attempt in range(3):
+                if self._listener.is_cancelled:
+                    return None
+                try:
+                    uploaded = await client.save_file(
+                        up_path, progress=self._hyper_progress(client)
+                    )
+                    break
+                except (FloodWait, FloodPremiumWait) as f:
+                    LOGGER.warning(f"HyperUL save_file: {f}")
+                    await sleep(f.value + 1)
+                except StopTransmission:
+                    return None
+                except Exception as e:
+                    if attempt == 2:
+                        raise
+                    LOGGER.warning(f"HyperUL save_file retry {attempt + 1}: {e}")
+                    await sleep((attempt + 1) * 2)
+            if uploaded is None:
+                # pre-upload failed; keep order via classic re-upload
+                return {"mode": "classic", **base}
+            thumb_file = None
+            if meta["thumb"]:
+                try:
+                    thumb_file = await client.save_file(meta["thumb"])
+                except Exception as e:
+                    LOGGER.warning(f"HyperUL thumb save failed: {e}")
+            return {
+                "mode": "hyper",
+                "index": index,
+                "client": client,
+                "uploaded": uploaded,
+                "thumb_file": thumb_file,
+                "meta": meta,
+                **base,
+            }
+        except Exception as err:
+            LOGGER.warning(
+                f"HyperUL pre-upload failed ({err}); will re-upload classically: {file_}"
+            )
+            return {"mode": "classic", **base}
+        finally:
+            TgClient.helper_loads[index] -= 1
+
+    async def _hyper_send(self, res):
+        """Ordered sender: posts one pre-uploaded file (or classic-uploads
+        it as fallback), then runs the usual post-send bookkeeping."""
+        file_, f_path = res["file"], res["f_path"]
+        self._up_path = res["path"]
+        self._is_corrupted = False
+        try:
+            if self._last_msg_in_group:
+                group_lists = [
+                    x for v in self._media_dict.values() for x in v.keys()
+                ]
+                match = re_match(r".+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)", f_path)
+                if not match or match and match.group(0) not in group_lists:
+                    for key, value in list(self._media_dict.items()):
+                        for subkey, msgs in list(value.items()):
+                            if len(msgs) > 1:
+                                await self._send_media_group(subkey, key, msgs)
+            self._last_msg_in_group = False
+
+            if res["mode"] == "classic":
+                f_size = await aiopath.getsize(self._up_path)
+                self._prm_media = f_size > 2097152000
+                await self._switching_client()
+                self._last_uploaded = 0
+                if self._helper_index is not None:
+                    TgClient.helper_loads[self._helper_index] += 1
+                try:
+                    await self._upload_file(res["cap"], file_, f_path)
+                finally:
+                    if self._helper_index is not None:
+                        TgClient.helper_loads[self._helper_index] -= 1
+            else:
+                client = res["client"]
+                self._client = client
+                meta = res["meta"]
+                media = build_uploaded_media(
+                    meta["kind"],
+                    res["uploaded"],
+                    self._up_path,
+                    thumb_file=res["thumb_file"],
+                    duration=meta["duration"],
+                    width=meta["width"],
+                    height=meta["height"],
+                    performer=meta["performer"],
+                    title=meta["title"],
+                )
+                sent = None
+                last_exc = None
+                for attempt in range(3):
+                    if self._listener.is_cancelled:
+                        raise CancelledUpload()
+                    try:
+                        sent = await raw_send_media(
+                            client,
+                            self._upload_chat_id,
+                            media,
+                            res["cap"],
+                            reply_to_id=self._reply_to_id,
+                        )
+                        break
+                    except (FloodWait, FloodPremiumWait) as f:
+                        LOGGER.warning(f"HyperUL send: {f}")
+                        await sleep(f.value + 1)
+                    except Exception as e:
+                        last_exc = e
+                        break
+                if sent is None:
+                    LOGGER.warning(
+                        f"HyperUL raw send failed ({last_exc}); re-uploading classically: {file_}"
+                    )
+                    await self._switching_client()
+                    self._last_uploaded = 0
+                    await self._upload_file(res["cap"], file_, f_path)
+                else:
+                    self._sent_msg = sent
+                    self._reply_to_id = sent.id
+                    await self._post_send_actions(f_path)
+                th = meta.get("thumb")
+                if self._thumb is None and th and await aiopath.exists(th):
+                    await remove(th)
+
+            if self._log_msg and not self._is_log_del and Config.CLEAN_LOG_MSG:
+                await delete_message(self._log_msg)
+                self._is_log_del = True
+            if self._listener.is_cancelled:
+                return
+            if (
+                not self._is_corrupted
+                and (self._listener.is_super_chat or self._listener.up_dest)
+                and self._sent_msg is not None
+                and hasattr(self._sent_msg, "chat")
+                and self._sent_msg.chat is not None
+                and hasattr(self._sent_msg, "link")
+            ):
+                self._msgs_dict[self._sent_msg.link] = file_
+        except CancelledUpload:
+            raise
+        except Exception as err:
+            LOGGER.error(f"{err}. Path: {self._up_path}", exc_info=True)
+            self._error = str(err)
+            self._corrupted += 1
+        if not self._listener.is_cancelled and await aiopath.exists(self._up_path):
+            await remove(self._up_path)
 
     async def _cleanup_auto_thumb(self):
         if self._auto_thumb_path:
@@ -834,103 +1190,7 @@ class TelegramUploader:
                     raise RuntimeError("Telegram upload returned no message")
                 self._reply_to_id = self._sent_msg.id
 
-            if (
-                not self._listener.is_cancelled
-                and self._media_group
-                and (self._sent_msg.video or self._sent_msg.document)
-            ):
-                key = "documents" if self._sent_msg.document else "videos"
-                if match := re_match(r".+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)", o_path):
-                    pname = match.group(0)
-                    if pname in self._media_dict[key].keys():
-                        self._media_dict[key][pname].append(
-                            [self._upload_chat_id, self._sent_msg.id]
-                        )
-                    else:
-                        self._media_dict[key][pname] = [
-                            [self._upload_chat_id, self._sent_msg.id]
-                        ]
-                    msgs = self._media_dict[key][pname]
-                    if len(msgs) == 10:
-                        await self._send_media_group(pname, key, msgs)
-                    else:
-                        self._last_msg_in_group = True
-
-            if self._sent_msg:
-                await sleep(0.6)
-                await self._copy_media()
-                if self._listener.leech_dest:
-                    try:
-                        leech_dest = self._listener.leech_dest
-                        if not isinstance(leech_dest, int):
-                            if leech_dest.lstrip("-").isdigit():
-                                leech_dest = int(leech_dest)
-                        await TgClient.bot.copy_message(
-                            chat_id=leech_dest,
-                            from_chat_id=self._upload_chat_id,
-                            message_id=self._sent_msg.id,
-                            message_thread_id=self._listener.leech_dest_thread_id,
-                        )
-                    except Exception as e:
-                        if not self._listener.is_cancelled:
-                            LOGGER.error(
-                                f"Failed to forward to {self._listener.leech_dest}: {e}"
-                            )
-                            await send_message(
-                                self._listener.user_id,
-                                f"Failed to forward to {self._listener.leech_dest}\n{e}",
-                            )
-
-                selected_dumps = self._listener.selected_dumps
-                ldumps = self._listener.user_dict.get("LDUMP", {})
-
-                if selected_dumps is not None:
-                    if isinstance(selected_dumps, list):
-                        dumps_to_forward = {f"dump_{i}": d for i, d in enumerate(selected_dumps)}
-                    else:
-                        dumps_to_forward = {"selected": selected_dumps}
-                elif ldumps:
-                    dumps_to_forward = ldumps
-                else:
-                    dumps_to_forward = {}
-                
-                for dump_name, dump_chat in dumps_to_forward.items():
-                    try:
-                        dump_thread_id = None
-                        if not isinstance(dump_chat, int):
-                            if str(dump_chat).lower() == "pm":
-                                dump_chat = self._listener.user_id
-                            elif "|" in str(dump_chat):
-                                parts = str(dump_chat).split("|", 1)
-                                dump_chat = parts[0]
-                                if parts[1].lstrip("-").isdigit():
-                                    dump_thread_id = int(parts[1])
-                                if dump_chat.lstrip("-").isdigit():
-                                    dump_chat = int(dump_chat)
-                            elif str(dump_chat).lstrip("-").isdigit():
-                                dump_chat = int(dump_chat)
-
-                        if (dump_chat, dump_thread_id) == (self._upload_chat_id, self._listener.chat_thread_id):
-                            continue
-                        if self._listener.leech_dest:
-                            leech_dest_comp = self._listener.leech_dest
-                            if not isinstance(leech_dest_comp, int):
-                                if leech_dest_comp.lstrip("-").isdigit():
-                                    leech_dest_comp = int(leech_dest_comp)
-                            if (dump_chat, dump_thread_id) == (leech_dest_comp, self._listener.leech_dest_thread_id):
-                                continue
-
-                        await TgClient.bot.copy_message(
-                            chat_id=dump_chat,
-                            from_chat_id=self._upload_chat_id,
-                            message_id=self._sent_msg.id,
-                            message_thread_id=dump_thread_id,
-                        )
-                    except Exception as e:
-                        if not self._listener.is_cancelled:
-                            LOGGER.error(
-                                f"Failed to forward to LDUMP '{dump_name}' ({dump_chat}): {e}"
-                            )
+            await self._post_send_actions(o_path)
 
             if (
                 self._thumb is None
@@ -975,6 +1235,106 @@ class TelegramUploader:
                 LOGGER.error(f"Retrying As Document. Path: {self._up_path}")
                 return await self._upload_file(cap_mono, file, o_path, True)
             raise err
+
+    async def _post_send_actions(self, o_path):
+        if (
+            not self._listener.is_cancelled
+            and self._media_group
+            and (self._sent_msg.video or self._sent_msg.document)
+        ):
+            key = "documents" if self._sent_msg.document else "videos"
+            if match := re_match(r".+(?=\.0*\d+$)|.+(?=\.part\d+\..+$)", o_path):
+                pname = match.group(0)
+                if pname in self._media_dict[key].keys():
+                    self._media_dict[key][pname].append(
+                        [self._upload_chat_id, self._sent_msg.id]
+                    )
+                else:
+                    self._media_dict[key][pname] = [
+                        [self._upload_chat_id, self._sent_msg.id]
+                    ]
+                msgs = self._media_dict[key][pname]
+                if len(msgs) == 10:
+                    await self._send_media_group(pname, key, msgs)
+                else:
+                    self._last_msg_in_group = True
+
+        if self._sent_msg:
+            await sleep(0.6)
+            await self._copy_media()
+            if self._listener.leech_dest:
+                try:
+                    leech_dest = self._listener.leech_dest
+                    if not isinstance(leech_dest, int):
+                        if leech_dest.lstrip("-").isdigit():
+                            leech_dest = int(leech_dest)
+                    await TgClient.bot.copy_message(
+                        chat_id=leech_dest,
+                        from_chat_id=self._upload_chat_id,
+                        message_id=self._sent_msg.id,
+                        message_thread_id=self._listener.leech_dest_thread_id,
+                    )
+                except Exception as e:
+                    if not self._listener.is_cancelled:
+                        LOGGER.error(
+                            f"Failed to forward to {self._listener.leech_dest}: {e}"
+                        )
+                        await send_message(
+                            self._listener.user_id,
+                            f"Failed to forward to {self._listener.leech_dest}\n{e}",
+                        )
+
+            selected_dumps = self._listener.selected_dumps
+            ldumps = self._listener.user_dict.get("LDUMP", {})
+
+            if selected_dumps is not None:
+                if isinstance(selected_dumps, list):
+                    dumps_to_forward = {f"dump_{i}": d for i, d in enumerate(selected_dumps)}
+                else:
+                    dumps_to_forward = {"selected": selected_dumps}
+            elif ldumps:
+                dumps_to_forward = ldumps
+            else:
+                dumps_to_forward = {}
+            
+            for dump_name, dump_chat in dumps_to_forward.items():
+                try:
+                    dump_thread_id = None
+                    if not isinstance(dump_chat, int):
+                        if str(dump_chat).lower() == "pm":
+                            dump_chat = self._listener.user_id
+                        elif "|" in str(dump_chat):
+                            parts = str(dump_chat).split("|", 1)
+                            dump_chat = parts[0]
+                            if parts[1].lstrip("-").isdigit():
+                                dump_thread_id = int(parts[1])
+                            if dump_chat.lstrip("-").isdigit():
+                                dump_chat = int(dump_chat)
+                        elif str(dump_chat).lstrip("-").isdigit():
+                            dump_chat = int(dump_chat)
+
+                    if (dump_chat, dump_thread_id) == (self._upload_chat_id, self._listener.chat_thread_id):
+                        continue
+                    if self._listener.leech_dest:
+                        leech_dest_comp = self._listener.leech_dest
+                        if not isinstance(leech_dest_comp, int):
+                            if leech_dest_comp.lstrip("-").isdigit():
+                                leech_dest_comp = int(leech_dest_comp)
+                        if (dump_chat, dump_thread_id) == (leech_dest_comp, self._listener.leech_dest_thread_id):
+                            continue
+
+                    await TgClient.bot.copy_message(
+                        chat_id=dump_chat,
+                        from_chat_id=self._upload_chat_id,
+                        message_id=self._sent_msg.id,
+                        message_thread_id=dump_thread_id,
+                    )
+                except Exception as e:
+                    if not self._listener.is_cancelled:
+                        LOGGER.error(
+                            f"Failed to forward to LDUMP '{dump_name}' ({dump_chat}): {e}"
+                        )
+
 
     @property
     def hyper(self):
