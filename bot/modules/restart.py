@@ -184,7 +184,11 @@ async def confirm_restart(_, query):
     await delete_message(message)
     if data[1] == "confirm":
         intervals["stopAll"] = True
-        restart_message = await send_message(reply_to, "<i>Restarting...</i>")
+        # the replied-to /restart command may already be deleted (e.g.
+        # DELETE_LINKS) — fall back to the chat id so the notice still sends
+        restart_message = await send_message(
+            reply_to or message.chat.id, "<i>Restarting...</i>"
+        )
         await TgClient.stop()
         if scheduler.running:
             scheduler.shutdown(wait=False)
@@ -224,11 +228,16 @@ async def confirm_restart(_, query):
                 "(restart proceeds even if self-update failed).",
                 rc2,
             )
-        if restart_message is not None:
-            async with aiopen(".restartmsg", "w") as f:
-                await f.write(
-                    f"{restart_message.chat.id}\n{restart_message.id}\n"
-                )
+        # send_message returns an error string on failure; nothing past this
+        # point may raise, or the re-exec is skipped and the bot stays down
+        if restart_message is not None and not isinstance(restart_message, str):
+            try:
+                async with aiopen(".restartmsg", "w") as f:
+                    await f.write(
+                        f"{restart_message.chat.id}\n{restart_message.id}\n"
+                    )
+            except OSError as e:
+                LOGGER.error(f"Failed to write .restartmsg: {e}")
         osexecl(executable, executable, "-m", "bot")
     else:
         await delete_message(message, reply_to)
