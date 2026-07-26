@@ -843,6 +843,13 @@ class TelegramUploader:
                 return None
 
         # heavy byte transfer runs outside the lock, in parallel
+        if not await aiopath.exists(up_path):
+            LOGGER.error(
+                f"HyperUL: file vanished before pre-upload, episode will be "
+                f"missing from the sequence: {up_path}"
+            )
+            self._corrupted += 1
+            return None
         index = min(TgClient.helper_loads, key=TgClient.helper_loads.get)
         client = TgClient.helper_bots[index]
         TgClient.helper_loads[index] += 1
@@ -894,9 +901,14 @@ class TelegramUploader:
 
     async def _hyper_send(self, res):
         """Ordered sender: posts one pre-uploaded file (or classic-uploads
-        it as fallback), then runs the usual post-send bookkeeping."""
+        it as fallback), then runs the usual post-send bookkeeping.
+
+        NOTE: prefetch workers mutate self._up_path under _prep_lock while
+        this sender runs, so this method must only use its local up_path;
+        touching self._up_path outside _prep_lock deletes/uploads the
+        wrong (upcoming) file and silently drops episodes."""
         file_, f_path = res["file"], res["f_path"]
-        self._up_path = res["path"]
+        up_path = res["path"]
         self._is_corrupted = False
         try:
             if self._last_msg_in_group:
@@ -912,17 +924,22 @@ class TelegramUploader:
             self._last_msg_in_group = False
 
             if res["mode"] == "classic":
-                f_size = await aiopath.getsize(self._up_path)
-                self._prm_media = f_size > 2097152000
-                await self._switching_client()
-                self._last_uploaded = 0
-                if self._helper_index is not None:
-                    TgClient.helper_loads[self._helper_index] += 1
-                try:
-                    await self._upload_file(res["cap"], file_, f_path)
-                finally:
+                # _upload_file works on self._up_path, which prefetch
+                # workers also mutate — hold _prep_lock for the whole
+                # classic upload so they can't swap it mid-transfer
+                async with self._prep_lock:
+                    self._up_path = up_path
+                    f_size = await aiopath.getsize(up_path)
+                    self._prm_media = f_size > 2097152000
+                    await self._switching_client()
+                    self._last_uploaded = 0
                     if self._helper_index is not None:
-                        TgClient.helper_loads[self._helper_index] -= 1
+                        TgClient.helper_loads[self._helper_index] += 1
+                    try:
+                        await self._upload_file(res["cap"], file_, f_path)
+                    finally:
+                        if self._helper_index is not None:
+                            TgClient.helper_loads[self._helper_index] -= 1
             else:
                 client = res["client"]
                 self._client = client
@@ -930,7 +947,7 @@ class TelegramUploader:
                 media = build_uploaded_media(
                     meta["kind"],
                     res["uploaded"],
-                    self._up_path,
+                    up_path,
                     thumb_file=res["thumb_file"],
                     duration=meta["duration"],
                     width=meta["width"],
@@ -962,9 +979,11 @@ class TelegramUploader:
                     LOGGER.warning(
                         f"HyperUL raw send failed ({last_exc}); re-uploading classically: {file_}"
                     )
-                    await self._switching_client()
-                    self._last_uploaded = 0
-                    await self._upload_file(res["cap"], file_, f_path)
+                    async with self._prep_lock:
+                        self._up_path = up_path
+                        await self._switching_client()
+                        self._last_uploaded = 0
+                        await self._upload_file(res["cap"], file_, f_path)
                 else:
                     self._sent_msg = sent
                     self._reply_to_id = sent.id
@@ -990,11 +1009,13 @@ class TelegramUploader:
         except CancelledUpload:
             raise
         except Exception as err:
-            LOGGER.error(f"{err}. Path: {self._up_path}", exc_info=True)
+            LOGGER.error(f"{err}. Path: {up_path}", exc_info=True)
             self._error = str(err)
             self._corrupted += 1
-        if not self._listener.is_cancelled and await aiopath.exists(self._up_path):
-            await remove(self._up_path)
+        # clean up THIS file only — self._up_path may already point to a
+        # later file being prepped by a prefetch worker
+        if not self._listener.is_cancelled and await aiopath.exists(up_path):
+            await remove(up_path)
 
     async def _cleanup_auto_thumb(self):
         if self._auto_thumb_path:
