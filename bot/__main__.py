@@ -120,13 +120,8 @@ async def restart_sessions_confirm(_, query):
         restart_message = await send_message(reply_to, "Restarting Session(s)...")
         await delete_message(message)
         await TgClient.reload()
-        add_handlers()
-        TgClient.bot.add_handler(
-            CallbackQueryHandler(
-                restart_sessions_confirm,
-                filters=regex("^sessionrestart") & CustomFilters.sudo,
-            )
-        )
+        # Client.restart() keeps the dispatcher and its handlers —
+        # re-adding them here would duplicate every handler per restart
         await edit_message(restart_message, "Session(s) Restarted Successfully!")
     else:
         await delete_message(message)

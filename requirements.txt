@@ -1,6 +1,5 @@
 # This file is a part of NEO-WZML (github.com/irisXDR/NEO-WZML)
 
-asyncio
 aiofiles
 aiohttp
 aioshutil
@@ -39,8 +38,10 @@ urllib3
 uvicorn
 uvloop==0.21.0
 # wzgram (github.com/rjriajul/wzgram): drop-in pyrogram replacement with
-# Rust crypto (warpcrypto) for faster Telegram upload/download
-wzgram
+# Rust crypto (warpcrypto) for faster Telegram upload/download.
+# Pinned: UPDATE_PKGS reinstalls on restart and an unpinned jump could
+# break the raw-API hyper transfer paths.
+wzgram==3.0.23
 xattr
 yt-dlp[default,curl-cffi]
 parse-torrent-name

@@ -132,18 +132,3 @@ async def raw_send_media(
         raise ValueError("HyperUL: SendMedia returned no message id")
 
     return await client.get_messages(chat_id=chat_id, message_ids=msg_id)
-
-
-def tgram_engine_version():
-    """Detect which pyrogram-compatible library is installed so the
-    status engine tag is truthful (wzgram ships as module `pyrogram`)."""
-    from importlib.metadata import version as pkg_version, PackageNotFoundError
-
-    for dist, label in (("wzgram", "wzgram"), ("pyroblack", "Pyro")):
-        try:
-            return f"{label} v{pkg_version(dist)}"
-        except PackageNotFoundError:
-            continue
-    from pyrogram import __version__ as pyrover
-
-    return f"Pyro v{pyrover}"

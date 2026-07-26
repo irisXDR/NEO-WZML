@@ -10,7 +10,6 @@ from asyncio import (
     Event,
 )
 from datetime import datetime
-from math import ceil, floor
 from mimetypes import guess_extension
 from os import path as ospath
 from pathlib import Path
@@ -50,7 +49,9 @@ class HyperTGDownload:
         self.file_name = ""
         self._cancel_event = Event()
         self.session_pool = {}
-        self._cleaner_task = create_task(self._clean_cache())
+        # started lazily in handle_download so an early download_media
+        # failure can't leak an immortal background task
+        self._cleaner_task = None
 
     @staticmethod
     async def get_media_type(message):
@@ -89,6 +90,12 @@ class HyperTGDownload:
                 return FileId.decode(
                     getattr(await self.get_media_type(media), "file_id", "")
                 )
+            except FloodWait as f:
+                # honor the requested wait instead of failing with a
+                # misleading permissions error
+                last_error = f
+                retries += 1
+                await sleep(f.value + 1)
             except Exception as e:
                 last_error = e
                 retries += 1
@@ -97,6 +104,8 @@ class HyperTGDownload:
         LOGGER.error(
             f"Failed to get message {mid} from {self.dump_chat} with Client {client.me.username}"
         )
+        if isinstance(last_error, FloodWait):
+            raise last_error
         raise ValueError(
             f"Bot needs Admin access in Chat or message may be deleted. Error: {last_error}"
         )
@@ -133,6 +142,7 @@ class HyperTGDownload:
 
         retries = 0
         while retries < max_retries:
+            media_session = None
             try:
                 if file_id.dc_id != await client.storage.dc_id():
                     media_session = Session(
@@ -177,6 +187,13 @@ class HyperTGDownload:
                 return media_session
 
             except Exception:
+                # stop a half-started session so retries don't leak live
+                # network tasks that cleanup can never reach
+                if media_session is not None:
+                    try:
+                        await media_session.stop()
+                    except Exception:
+                        pass
                 retries += 1
                 await sleep(1)
 
@@ -234,6 +251,14 @@ class HyperTGDownload:
 
         self.work_loads[index] += 1
         current_retry = 0
+        file_id = None
+
+        # resume state lives OUTSIDE the retry loop: the consumer writes
+        # sequentially from its seek position, so a mid-stream retry must
+        # continue from the last yielded chunk — restarting from part 1
+        # would put bytes at wrong offsets and double-count progress
+        current_part = 1
+        current_offset = offset_bytes
 
         try:
             while current_retry < max_retries:
@@ -247,8 +272,7 @@ class HyperTGDownload:
                         self.get_location(file_id),
                     )
 
-                    current_part = 1
-                    current_offset = offset_bytes
+                    chunk_fails = 0
 
                     while current_part <= part_count:
                         if self._cancel_event.is_set():
@@ -283,10 +307,20 @@ class HyperTGDownload:
 
                                 current_part += 1
                                 current_offset += self.chunk_size
+                                chunk_fails = 0
                             else:
                                 raise ValueError(f"Unexpected response: {r}")
 
                         except (FloodWait, AsyncTimeoutError, ConnectionError) as e:
+                            # bounded: a dead session must escalate to the
+                            # outer retry (fresh session) instead of
+                            # hammering the same offset forever
+                            chunk_fails += 1
+                            if chunk_fails > 8:
+                                raise ConnectionError(
+                                    f"Chunk at offset {current_offset} failed "
+                                    f"{chunk_fails} times"
+                                ) from e
                             if isinstance(e, FloodWait):
                                 await sleep(e.value + 1)
                             else:
@@ -303,6 +337,15 @@ class HyperTGDownload:
                     current_retry += 1
                     if current_retry >= max_retries:
                         raise
+                    # drop the possibly-dead pooled session so the retry
+                    # builds a fresh one instead of reusing the corpse
+                    if file_id is not None:
+                        stale = self.session_pool.pop((index, file_id.dc_id), None)
+                        if stale is not None:
+                            try:
+                                await stale.stop()
+                            except Exception:
+                                pass
                     await sleep(current_retry * 2)
 
         finally:
@@ -320,6 +363,10 @@ class HyperTGDownload:
                     )
                 await sleep(1)
             except (CancelledError, StopTransmission):
+                # stop_transmission() raises here (the progress caller) —
+                # flip the event so every part task actually stops instead
+                # of downloading the whole file for nobody
+                self._cancel_event.set()
                 break
             except Exception:
                 await sleep(1)
@@ -331,8 +378,11 @@ class HyperTGDownload:
         first_part_cut = from_bytes - offset
         last_part_cut = until_bytes % self.chunk_size + 1
 
-        part_count = ceil(until_bytes / self.chunk_size) - floor(
-            offset / self.chunk_size
+        # inclusive chunk count; ceil() is one short when until_bytes
+        # lands exactly on a chunk boundary, silently zero-filling the
+        # tail of the part
+        part_count = (
+            until_bytes // self.chunk_size - offset // self.chunk_size + 1
         )
 
         for attempt in range(max_retries):
@@ -361,6 +411,8 @@ class HyperTGDownload:
 
     async def handle_download(self, progress, progress_args):
         self._cancel_event.clear()
+        if self._cleaner_task is None:
+            self._cleaner_task = create_task(self._clean_cache())
 
         await makedirs(self.directory, exist_ok=True)
         temp_file_path = (
@@ -416,7 +468,9 @@ class HyperTGDownload:
             return None
         except Exception as e:
             LOGGER.error(f"HyperDL Error: {e}")
-            return None
+            # propagate so the caller's plain-download fallback can run;
+            # returning None here would fail the whole task instead
+            raise
         finally:
             self._cancel_event.set()
             if prog_task and not prog_task.done():

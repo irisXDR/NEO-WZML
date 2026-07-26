@@ -84,12 +84,24 @@ async def update_qb_options():
         await TorrentManager.qbittorrent.app.set_preferences(qbit_options)
 
 
+def _valid_aria2_speed(value):
+    from re import fullmatch
+
+    return bool(value) and fullmatch(r"\d+[KkMmGg]?", str(value).strip()) is not None
+
+
 async def update_aria2_options():
     LOGGER.info("Get aria2 options from server")
     if not aria2_options:
         op = await TorrentManager.aria2.getGlobalOption()
         aria2_options.update(op)
     else:
+        # the DB snapshot predates the config cap and would silently
+        # reset it to unlimited — re-assert it on every options push
+        if _valid_aria2_speed(Config.ARIA2_MAX_DL_SPEED):
+            aria2_options["max-overall-download-limit"] = str(
+                Config.ARIA2_MAX_DL_SPEED
+            ).strip()
         await TorrentManager.aria2.changeGlobalOption(aria2_options)
 
 
@@ -392,7 +404,7 @@ async def load_configurations():
     aria2_cmd = (
         f"{BinConfig.ARIA2_NAME} --allow-overwrite=true --auto-file-renaming=true "
         f"--bt-enable-lpd=true --bt-detach-seed-only=true --bt-remove-unselected-file=true "
-        f"--bt-max-peers=0 --enable-rpc=true --rpc-listen-port=6800 --rpc-listen-all=true --rpc-max-request-size=1024M "
+        f"--bt-max-peers=0 --enable-rpc=true --rpc-listen-port=6800 --rpc-listen-all=false --rpc-max-request-size=1024M "
         f"--max-connection-per-server=10 --max-concurrent-downloads=1000 --split=10 "
         f"--seed-ratio=0 --check-integrity=true --continue=true --daemon=true "
         f"--disk-cache=40M --force-save=true --min-split-size=10M --follow-torrent=mem "
@@ -405,7 +417,16 @@ async def load_configurations():
     if Config.ARIA2_MAX_DL_SPEED:
         # cap aggregate download rate so a fast mirror can't saturate the
         # VPS disk/NIC and freeze the whole machine (e.g. "80M")
-        aria2_cmd += f" --max-overall-download-limit={Config.ARIA2_MAX_DL_SPEED}"
+        if _valid_aria2_speed(Config.ARIA2_MAX_DL_SPEED):
+            aria2_cmd += (
+                f" --max-overall-download-limit="
+                f"{str(Config.ARIA2_MAX_DL_SPEED).strip()}"
+            )
+        else:
+            LOGGER.error(
+                f"Invalid ARIA2_MAX_DL_SPEED '{Config.ARIA2_MAX_DL_SPEED}' "
+                f"(use digits + optional K/M/G, e.g. 80M) — ignoring"
+            )
     await (await create_subprocess_shell(aria2_cmd)).wait()
 
     PORT = getenv("PORT", "") or Config.BASE_URL_PORT

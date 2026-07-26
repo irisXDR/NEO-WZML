@@ -4,7 +4,9 @@ from pyrogram.filters import command, private, regex
 from pyrogram.handlers import CallbackQueryHandler, EditedMessageHandler, MessageHandler
 from pyrogram.types import BotCommand
 
-from bot import bot_loop
+from bot import LOGGER, bot_loop
+
+_set_commands_task = None
 from bot.core.config_manager import Config
 from bot.helper.ext_utils.help_messages import get_bot_commands
 from bot.helper.telegram_helper.bot_commands import BotCommands
@@ -440,4 +442,13 @@ def add_handlers():
                     BotCommand(f"{cmd.lower()}{Config.CMD_SUFFIX}", description)
                 )
 
-        bot_loop.create_task(TgClient.bot.set_bot_commands(telegram_commands))
+        def _log_cmd_failure(task):
+            if not task.cancelled() and (exc := task.exception()):
+                LOGGER.error(f"Failed to set bot commands: {exc}")
+
+        # keep a strong reference so the task can't be GC'd mid-flight
+        global _set_commands_task
+        _set_commands_task = bot_loop.create_task(
+            TgClient.bot.set_bot_commands(telegram_commands)
+        )
+        _set_commands_task.add_done_callback(_log_cmd_failure)

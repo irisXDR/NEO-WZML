@@ -140,7 +140,9 @@ class TelegramUploader:
                 self._listener.user_dict.get(key) or getattr(Config, key, default),
             )
 
-        self._media_group = False
+        self._media_group = bool(
+            self._listener.user_dict.get("MEDIA_GROUP") or Config.MEDIA_GROUP
+        )
 
         if isinstance(self._lcaption, dict):
             self._lcaption = self._lcaption.get("text", "")
@@ -258,6 +260,13 @@ class TelegramUploader:
             else:
                 dur, qual, lang, subs = 0, "", "", ""
 
+            # hashing a multi-GB file is expensive (and serializes the
+            # hyper pipeline) — only do it when the template asks for it
+            md5_val = (
+                await sync_to_async(get_md5_hash, up_path)
+                if "{md5_hash}" in template_to_format
+                else ""
+            )
             cap_mono = template_to_format.format(
                 filename=file_,
                 size=get_readable_file_size(await aiopath.getsize(up_path)),
@@ -265,7 +274,7 @@ class TelegramUploader:
                 quality=qual,
                 languages=lang,
                 subtitles=subs,
-                md5_hash=await sync_to_async(get_md5_hash, up_path),
+                md5_hash=md5_val,
                 mime_type=self._listener.file_details.get("mime_type", "text/plain"),
                 prefilename=self._listener.file_details.get("filename", ""),
                 precaption=self._listener.file_details.get("caption", ""),
@@ -671,18 +680,29 @@ class TelegramUploader:
             slots = min(slots, Config.HYPER_THREADS)
         slots = max(1, min(slots, 8))
         sem = Semaphore(slots)
+        # backpressure: at most slots+2 files may sit pre-uploaded but
+        # unposted, so a sender stalled on a FloodWait doesn't let workers
+        # upload the entire task ahead (wasted on cancel, stale on server)
+        ahead = Semaphore(slots + 2)
 
         async def prefetch(dirpath, file_):
-            async with sem:
-                if self._listener.is_cancelled:
-                    return None
-                try:
-                    return await self._hyper_prefetch(dirpath, file_)
-                except Exception as e:
-                    LOGGER.error(f"HyperUL prefetch failed: {e}", exc_info=True)
-                    self._error = str(e)
-                    self._corrupted += 1
-                    return None
+            await ahead.acquire()
+            keep_slot = False
+            try:
+                async with sem:
+                    if self._listener.is_cancelled:
+                        return None
+                    res = await self._hyper_prefetch(dirpath, file_)
+                    keep_slot = res is not None
+                    return res
+            except Exception as e:
+                LOGGER.error(f"HyperUL prefetch failed: {e}", exc_info=True)
+                self._error = str(e)
+                self._corrupted += 1
+                return None
+            finally:
+                if not keep_slot:
+                    ahead.release()
 
         # tasks acquire the semaphore in creation order, so earlier
         # episodes always get upload slots first
@@ -698,6 +718,8 @@ class TelegramUploader:
                     await self._hyper_send(res)
                 except CancelledUpload:
                     return
+                finally:
+                    ahead.release()
         finally:
             for t in tasks:
                 if not t.done():
@@ -713,7 +735,16 @@ class TelegramUploader:
             self._processed_bytes += current - state["last"]
             state["last"] = current
 
-        return progress
+        return progress, state
+
+    async def _sleep_checked(self, seconds):
+        """Sleep in short slices; False means the task got cancelled."""
+        end = time() + seconds
+        while time() < end:
+            if self._listener.is_cancelled:
+                return False
+            await sleep(min(2, max(0.1, end - time())))
+        return not self._listener.is_cancelled
 
     async def _hyper_media_meta(self, file_):
         """Detect media kind and prepare thumb/dimensions for the current
@@ -790,7 +821,6 @@ class TelegramUploader:
         async with self._prep_lock:
             if self._listener.is_cancelled:
                 return None
-            self._error = ""
             self._up_path = f_path
             if not await aiopath.exists(self._up_path):
                 LOGGER.error(f"{self._up_path} not exists! Continue uploading!")
@@ -843,6 +873,10 @@ class TelegramUploader:
                 return None
 
         # heavy byte transfer runs outside the lock, in parallel
+        if not self._hyper_ul:
+            # helper posting got disabled mid-task (e.g. bot not admin);
+            # skip pre-upload so the file isn't transferred twice
+            return {"mode": "classic", **base}
         if not await aiopath.exists(up_path):
             LOGGER.error(
                 f"HyperUL: file vanished before pre-upload, episode will be "
@@ -855,24 +889,35 @@ class TelegramUploader:
         TgClient.helper_loads[index] += 1
         try:
             uploaded = None
-            for attempt in range(3):
+            attempts = 0
+            floods = 0
+            while uploaded is None:
                 if self._listener.is_cancelled:
                     return None
+                prog, pstate = self._hyper_progress(client)
                 try:
-                    uploaded = await client.save_file(
-                        up_path, progress=self._hyper_progress(client)
-                    )
-                    break
+                    uploaded = await client.save_file(up_path, progress=prog)
                 except (FloodWait, FloodPremiumWait) as f:
+                    # roll back this attempt's bytes so progress can't
+                    # exceed 100%; floods don't burn real-error attempts
+                    self._processed_bytes -= pstate["last"]
+                    floods += 1
+                    if floods > 6:
+                        break
                     LOGGER.warning(f"HyperUL save_file: {f}")
-                    await sleep(f.value + 1)
+                    if not await self._sleep_checked(f.value + 1):
+                        return None
                 except StopTransmission:
+                    self._processed_bytes -= pstate["last"]
                     return None
                 except Exception as e:
-                    if attempt == 2:
+                    self._processed_bytes -= pstate["last"]
+                    attempts += 1
+                    if attempts >= 3:
                         raise
-                    LOGGER.warning(f"HyperUL save_file retry {attempt + 1}: {e}")
-                    await sleep((attempt + 1) * 2)
+                    LOGGER.warning(f"HyperUL save_file retry {attempts}: {e}")
+                    if not await self._sleep_checked(attempts * 2):
+                        return None
             if uploaded is None:
                 # pre-upload failed; keep order via classic re-upload
                 return {"mode": "classic", **base}
@@ -957,7 +1002,8 @@ class TelegramUploader:
                 )
                 sent = None
                 last_exc = None
-                for attempt in range(3):
+                floods = 0
+                while sent is None:
                     if self._listener.is_cancelled:
                         raise CancelledUpload()
                     try:
@@ -967,11 +1013,18 @@ class TelegramUploader:
                             media,
                             res["cap"],
                             reply_to_id=self._reply_to_id,
+                            thread_id=self._listener.chat_thread_id,
                         )
-                        break
                     except (FloodWait, FloodPremiumWait) as f:
+                        # the bytes are already on Telegram — waiting out
+                        # the flood is far cheaper than a full re-upload
+                        last_exc = f
+                        floods += 1
+                        if floods > 6:
+                            break
                         LOGGER.warning(f"HyperUL send: {f}")
-                        await sleep(f.value + 1)
+                        if not await self._sleep_checked(f.value + 1):
+                            raise CancelledUpload()
                     except Exception as e:
                         last_exc = e
                         break
@@ -981,9 +1034,17 @@ class TelegramUploader:
                     )
                     async with self._prep_lock:
                         self._up_path = up_path
+                        f_size = await aiopath.getsize(up_path)
+                        self._prm_media = f_size > 2097152000
                         await self._switching_client()
                         self._last_uploaded = 0
-                        await self._upload_file(res["cap"], file_, f_path)
+                        if self._helper_index is not None:
+                            TgClient.helper_loads[self._helper_index] += 1
+                        try:
+                            await self._upload_file(res["cap"], file_, f_path)
+                        finally:
+                            if self._helper_index is not None:
+                                TgClient.helper_loads[self._helper_index] -= 1
                 else:
                     self._sent_msg = sent
                     self._reply_to_id = sent.id
@@ -1024,8 +1085,6 @@ class TelegramUploader:
             self._auto_thumb_path = None
 
     async def _send_with_floodwait_retry(self, send_method, **kwargs):
-        base_processed = self._processed_bytes
-
         try:
             from pyrogram.errors import SlowmodeWait as _SlowmodeWait
         except ImportError:
@@ -1042,16 +1101,19 @@ class TelegramUploader:
                     return result
                 if attempt < 2:
                     self._check_cancelled()
-                    self._processed_bytes = base_processed
+                    # roll back only THIS send's bytes — hyper prefetch
+                    # workers may have added progress concurrently, and an
+                    # absolute restore would erase theirs too
+                    self._processed_bytes -= self._last_uploaded
                     await sleep(2 ** attempt)
             except wait_exc_types as f:
                 if attempt == 2:
                     raise
                 self._check_cancelled()
                 LOGGER.warning(str(f))
-                await sleep(getattr(f, "value", 5) + 1)
-                self._check_cancelled()
-                self._processed_bytes = base_processed
+                if not await self._sleep_checked(getattr(f, "value", 5) + 1):
+                    raise CancelledUpload()
+                self._processed_bytes -= self._last_uploaded
 
         raise RuntimeError("send_* returned None after 3 attempts")
 

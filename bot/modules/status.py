@@ -86,7 +86,7 @@ async def get_download_status(download):
     eng = download.engine
     speed = (
         download.speed()
-        if eng.startswith(("Pyro", "yt-dlp", "RClone", "Google-API"))
+        if eng.startswith(("Pyro", "wzgram", "yt-dlp", "RClone", "Google-API"))
         else 0
     )
     return (
@@ -198,7 +198,8 @@ async def status_pages(_, query):
                         dl_speed += speed_string_to_bytes(speed)
                 case MirrorStatus.STATUS_UPLOAD:
                     tasks["Upload"] += 1
-                    up_speed += speed_string_to_bytes(speed)
+                    if speed:
+                        up_speed += speed_string_to_bytes(speed)
                 case MirrorStatus.STATUS_SEED:
                     tasks["Seed"] += 1
                 case MirrorStatus.STATUS_ARCHIVE:
@@ -244,7 +245,4 @@ async def status_pages(_, query):
         button.data_button("Back", f"status {data[1]} ref")
         await edit_message(message, msg, button.build_menu())
 
-    try:
-        await query.answer()
-    except QueryIdInvalid:
-        pass
+    await _safe_answer(query)
