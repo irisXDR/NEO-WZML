@@ -4,6 +4,7 @@ from pyrogram.filters import command, private, regex
 from pyrogram.handlers import CallbackQueryHandler, EditedMessageHandler, MessageHandler
 from pyrogram.types import BotCommand
 
+from bot import bot_loop
 from bot.core.config_manager import Config
 from bot.helper.ext_utils.help_messages import get_bot_commands
 from bot.helper.telegram_helper.bot_commands import BotCommands
@@ -439,4 +440,4 @@ def add_handlers():
                     BotCommand(f"{cmd.lower()}{Config.CMD_SUFFIX}", description)
                 )
 
-        TgClient.bot.set_bot_commands(telegram_commands)
+        bot_loop.create_task(TgClient.bot.set_bot_commands(telegram_commands))
